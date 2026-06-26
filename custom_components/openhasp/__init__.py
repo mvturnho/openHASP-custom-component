@@ -68,6 +68,9 @@ from .const import (
     CONF_CHART_SERIES,
     CONF_CHART_TYPE,
     CONF_CHART_VDIV,
+    CONF_CHART_Y_LABEL,
+    CONF_CHART_Y_LABEL,
+    CONF_CHART_SHOW_SCALE,
     CONF_COMPONENT,
     CONF_EVENT,
     CONF_HWID,
@@ -158,6 +161,9 @@ CHART_SCHEMA = vol.Schema(
         vol.Optional(CONF_CHART_VDIV): vol.All(int, vol.Range(min=0, max=255)),
         vol.Optional(CONF_CHART_LINE_WIDTH): vol.All(int, vol.Range(min=1, max=20)),
         vol.Optional(CONF_CHART_POINT_SIZE, default=0): vol.All(int, vol.Range(min=0, max=20)),
+        vol.Optional(CONF_CHART_Y_LABEL): cv.string,
+        vol.Optional(CONF_CHART_Y_LABEL): cv.string,
+        vol.Optional(CONF_CHART_SHOW_SCALE, default=False): cv.boolean,
     }
 )
 
@@ -793,6 +799,8 @@ class HASPChart:
                 CONF_CHART_VDIV,
                 CONF_CHART_LINE_WIDTH,
                 CONF_CHART_POINT_SIZE,
+                CONF_CHART_Y_LABEL,
+                CONF_CHART_SHOW_SCALE,
             )
             if k in chart_cfg
         }
@@ -855,6 +863,7 @@ class HASPChart:
             CONF_CHART_VDIV:        "vdiv",
             CONF_CHART_LINE_WIDTH:  "line_width",
             CONF_CHART_POINT_SIZE:  "point_size",
+            CONF_CHART_Y_LABEL:     "y_label",
         }
         for conf_key, mqtt_attr in attr_map.items():
             if conf_key in self._visual:
@@ -863,6 +872,11 @@ class HASPChart:
                 await async_publish(
                     self.hass, self.command_topic + mqtt_attr, payload, qos=0, retain=False
                 )
+
+        if self._visual.get(CONF_CHART_SHOW_SCALE):
+            await async_publish(
+                self.hass, self.command_topic + "y_scale", "1", qos=0, retain=False
+            )
 
     async def _send_history(self):
         """Fetch recorder history and push full dataset to each series."""

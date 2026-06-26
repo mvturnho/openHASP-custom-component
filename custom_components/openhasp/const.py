@@ -46,6 +46,8 @@ CONF_CHART_VDIV = "vdiv"
 CONF_CHART_LINE_WIDTH = "line_width"
 CONF_CHART_POINT_SIZE = "point_size"
 CONF_CHART_SCALE = "scale"
+CONF_CHART_Y_LABEL = "y_label"
+CONF_CHART_SHOW_SCALE = "show_scale"
 
 
 DATA_LISTENER = "listener"
