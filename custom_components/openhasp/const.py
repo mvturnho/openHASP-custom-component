@@ -30,6 +30,23 @@ CONF_HWID = "hwid"
 CONF_INPUT = "input"
 CONF_SUBTOPIC = "subtopic"
 
+# Chart object config keys
+CONF_CHART = "chart"
+CONF_CHART_SERIES = "series"
+CONF_CHART_ENTITY = "entity"
+CONF_CHART_COLOR = "color"
+CONF_CHART_HISTORY_HOURS = "history_hours"
+CONF_CHART_TYPE = "type"
+CONF_CHART_MIN = "min"
+CONF_CHART_MAX = "max"
+CONF_CHART_POINT_COUNT = "point_count"
+CONF_CHART_GRID_COLOR = "grid_color"
+CONF_CHART_HDIV = "hdiv"
+CONF_CHART_VDIV = "vdiv"
+CONF_CHART_LINE_WIDTH = "line_width"
+CONF_CHART_POINT_SIZE = "point_size"
+CONF_CHART_SCALE = "scale"
+
 
 DATA_LISTENER = "listener"
 DATA_IMAGES = "images"

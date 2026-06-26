@@ -5,6 +5,7 @@ import logging
 import os
 import pathlib
 import re
+from datetime import timedelta
 
 from homeassistant.helpers.device_registry import (
     CONNECTION_NETWORK_MAC,
@@ -23,7 +24,12 @@ from homeassistant.exceptions import TemplateError
 from homeassistant.helpers import device_registry as dr, entity_registry
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.event import TrackTemplate, async_track_template_result
+from homeassistant.helpers.event import (
+    TrackTemplate,
+    async_track_state_change_event,
+    async_track_template_result,
+)
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.network import get_url
 from homeassistant.helpers.reload import async_integration_yaml_config
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -47,6 +53,21 @@ from .const import (
     ATTR_PAGE,
     ATTR_PATH,
     ATTR_WIDTH,
+    CONF_CHART,
+    CONF_CHART_COLOR,
+    CONF_CHART_ENTITY,
+    CONF_CHART_GRID_COLOR,
+    CONF_CHART_HDIV,
+    CONF_CHART_HISTORY_HOURS,
+    CONF_CHART_LINE_WIDTH,
+    CONF_CHART_MAX,
+    CONF_CHART_MIN,
+    CONF_CHART_POINT_COUNT,
+    CONF_CHART_POINT_SIZE,
+    CONF_CHART_SCALE,
+    CONF_CHART_SERIES,
+    CONF_CHART_TYPE,
+    CONF_CHART_VDIV,
     CONF_COMPONENT,
     CONF_EVENT,
     CONF_HWID,
@@ -114,6 +135,32 @@ EVENT_SCHEMA = cv.schema_with_slug_keys(cv.SCRIPT_SCHEMA)
 
 PROPERTY_SCHEMA = cv.schema_with_slug_keys(cv.template)
 
+CHART_SERIES_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_CHART_ENTITY): cv.entity_id,
+        vol.Optional(CONF_CHART_COLOR, default="#ffffff"): cv.string,
+        vol.Optional(CONF_CHART_HISTORY_HOURS, default=1): vol.All(
+            vol.Coerce(float), vol.Range(min=0.1, max=168)
+        ),
+    }
+)
+
+CHART_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_CHART_SERIES): vol.All(cv.ensure_list, [CHART_SERIES_SCHEMA]),
+        vol.Optional(CONF_CHART_TYPE): vol.All(int, vol.Range(min=0, max=2)),
+        vol.Optional(CONF_CHART_MIN): vol.Coerce(float),
+        vol.Optional(CONF_CHART_MAX): vol.Coerce(float),
+        vol.Optional(CONF_CHART_SCALE, default=1.0): vol.Coerce(float),
+        vol.Optional(CONF_CHART_POINT_COUNT): vol.All(int, vol.Range(min=1, max=1000)),
+        vol.Optional(CONF_CHART_GRID_COLOR): cv.string,
+        vol.Optional(CONF_CHART_HDIV): vol.All(int, vol.Range(min=0, max=255)),
+        vol.Optional(CONF_CHART_VDIV): vol.All(int, vol.Range(min=0, max=255)),
+        vol.Optional(CONF_CHART_LINE_WIDTH): vol.All(int, vol.Range(min=1, max=20)),
+        vol.Optional(CONF_CHART_POINT_SIZE, default=0): vol.All(int, vol.Range(min=0, max=20)),
+    }
+)
+
 OBJECT_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_OBJID): hasp_object,
@@ -121,6 +168,7 @@ OBJECT_SCHEMA = vol.Schema(
         vol.Optional(CONF_PROPERTIES, default={}): PROPERTY_SCHEMA,
         vol.Optional(CONF_EVENT, default={}): EVENT_SCHEMA,
         vol.Optional(CONF_SUBTOPIC): cv.string,
+        vol.Optional(CONF_CHART): CHART_SCHEMA,
     }
 )
 
@@ -358,8 +406,10 @@ class SwitchPlate(RestoreEntity):
 
         self._objects = []
         for obj in config[CONF_OBJECTS]:
-            new_obj = HASPObject(hass, self._topic, obj)
-
+            if CONF_CHART in obj:
+                new_obj = HASPChart(hass, self._topic, obj)
+            else:
+                new_obj = HASPObject(hass, self._topic, obj)
             self._objects.append(new_obj)
         self._statusupdate = {HASP_NUM_PAGES: entry.data[CONF_PAGES]}
         self._available = False
@@ -716,6 +766,173 @@ class SwitchPlate(RestoreEntity):
                 os.path.basename(path),
                 e.message,
             )
+
+
+class HASPChart:
+    """Representation of an openHASP chart object fed by HA entity history."""
+
+    def __init__(self, hass, plate_topic, config):
+        """Initialize chart object."""
+        self.hass = hass
+        self.obj_id = config[CONF_OBJID]
+        subtopic = config.get(CONF_SUBTOPIC)
+        prefix = f"{plate_topic}/command/{subtopic}/{self.obj_id}." if subtopic else f"{plate_topic}/command/{self.obj_id}."
+        self.command_topic = prefix
+        chart_cfg = config[CONF_CHART]
+        self._series = chart_cfg[CONF_CHART_SERIES]
+        self._scale = chart_cfg.get(CONF_CHART_SCALE, 1.0)
+        self._chart_min = chart_cfg.get(CONF_CHART_MIN)
+        self._chart_max = chart_cfg.get(CONF_CHART_MAX)
+        self._point_count = chart_cfg.get(CONF_CHART_POINT_COUNT)
+        self._visual = {
+            k: chart_cfg[k]
+            for k in (
+                CONF_CHART_TYPE,
+                CONF_CHART_GRID_COLOR,
+                CONF_CHART_HDIV,
+                CONF_CHART_VDIV,
+                CONF_CHART_LINE_WIDTH,
+                CONF_CHART_POINT_SIZE,
+            )
+            if k in chart_cfg
+        }
+        self._subscriptions = []
+
+    async def enable_object(self):
+        """Configure chart visuals, send history bootstrap, subscribe to live updates."""
+        await self._send_visual_config()
+        await self._send_history()
+
+        for idx, series in enumerate(self._series):
+            entity_id = series[CONF_CHART_ENTITY]
+
+            def _make_listener(ser_idx):
+                @callback
+                async def _state_changed(event):
+                    new_state = event.data.get("new_state")
+                    if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                        return
+                    try:
+                        value = round(float(new_state.state), 2)
+                    except (ValueError, TypeError):
+                        return
+                    append_payload = {"ser": ser_idx, "val": value}
+                    if self._scale != 1.0:
+                        append_payload["scale"] = self._scale
+                    _LOGGER.debug("Chart %s append ser=%d val=%s", self.obj_id, ser_idx, value)
+                    await async_publish(self.hass, self.command_topic + "append", json.dumps(append_payload), qos=0, retain=False)
+                return _state_changed
+
+            self._subscriptions.append(
+                async_track_state_change_event(self.hass, [entity_id], _make_listener(idx))
+            )
+
+    async def disable_object(self):
+        """Remove state subscriptions."""
+        for unsub in self._subscriptions:
+            unsub()
+        self._subscriptions = []
+
+    async def refresh(self):
+        """Re-send visual config and full history when plate reconnects."""
+        await self._send_visual_config()
+        await self._send_history()
+
+    async def _send_visual_config(self):
+        """Send series colours (+ optional type) and all visual attributes to the device."""
+        colors = [s.get(CONF_CHART_COLOR, "#ffffff") for s in self._series]
+        if CONF_CHART_TYPE in self._visual:
+            series_payload = json.dumps({"type": self._visual[CONF_CHART_TYPE], "colors": colors})
+        else:
+            series_payload = json.dumps(colors)
+        await async_publish(
+            self.hass, self.command_topic + "series", series_payload, qos=0, retain=False
+        )
+
+        attr_map = {
+            CONF_CHART_GRID_COLOR:  "grid_color",
+            CONF_CHART_HDIV:        "hdiv",
+            CONF_CHART_VDIV:        "vdiv",
+            CONF_CHART_LINE_WIDTH:  "line_width",
+            CONF_CHART_POINT_SIZE:  "point_size",
+        }
+        for conf_key, mqtt_attr in attr_map.items():
+            if conf_key in self._visual:
+                val = self._visual[conf_key]
+                payload = json.dumps(val) if not isinstance(val, str) else val
+                await async_publish(
+                    self.hass, self.command_topic + mqtt_attr, payload, qos=0, retain=False
+                )
+
+    async def _send_history(self):
+        """Fetch recorder history and push full dataset to each series."""
+        try:
+            from homeassistant.components.recorder import get_instance
+            from homeassistant.components.recorder.history import get_significant_states
+        except ImportError:
+            _LOGGER.warning("Recorder unavailable; chart %s will show current state only", self.obj_id)
+            await self._send_current_state()
+            return
+
+        for idx, series in enumerate(self._series):
+            entity_id = series[CONF_CHART_ENTITY]
+            hours = series[CONF_CHART_HISTORY_HOURS]
+            start = dt_util.utcnow() - timedelta(hours=hours)
+
+            try:
+                states = await get_instance(self.hass).async_add_executor_job(
+                    get_significant_states,
+                    self.hass,
+                    start,
+                    None,
+                    [entity_id],
+                )
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.error("Error fetching history for %s: %s", entity_id, err)
+                continue
+
+            values = []
+            for state in states.get(entity_id, []):
+                try:
+                    values.append(round(float(state.state), 2))
+                except (ValueError, TypeError):
+                    pass
+
+            if not values:
+                _LOGGER.debug("No history for %s (series %d)", entity_id, idx)
+                continue
+
+            data_payload = {"ser": idx, "data": values}
+            if self._scale != 1.0:
+                data_payload["scale"] = self._scale
+            if self._chart_min is not None:
+                data_payload["min"] = self._chart_min
+            if self._chart_max is not None:
+                data_payload["max"] = self._chart_max
+
+            payload = json.dumps(data_payload)
+            _LOGGER.debug("Chart %s series %d: bootstrapping %d points", self.obj_id, idx, len(values))
+            await async_publish(self.hass, self.command_topic + "data", payload, qos=0, retain=False)
+
+    async def _send_current_state(self):
+        """Fallback: push only the current state as a single-point dataset."""
+        for idx, series in enumerate(self._series):
+            entity_id = series[CONF_CHART_ENTITY]
+            state = self.hass.states.get(entity_id)
+            if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                continue
+            try:
+                value = round(float(state.state), 2)
+            except (ValueError, TypeError):
+                continue
+            data_payload = {"ser": idx, "data": [value]}
+            if self._scale != 1.0:
+                data_payload["scale"] = self._scale
+            if self._chart_min is not None:
+                data_payload["min"] = self._chart_min
+            if self._chart_max is not None:
+                data_payload["max"] = self._chart_max
+            await async_publish(self.hass, self.command_topic + "data", json.dumps(data_payload), qos=0, retain=False)
 
 
 # pylint: disable=R0902
