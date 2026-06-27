@@ -2,6 +2,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import pathlib
 import re
@@ -28,6 +29,7 @@ from homeassistant.helpers.event import (
     TrackTemplate,
     async_track_state_change_event,
     async_track_template_result,
+    async_track_time_interval,
 )
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.network import get_url
@@ -59,6 +61,7 @@ from .const import (
     CONF_CHART_GRID_COLOR,
     CONF_CHART_HDIV,
     CONF_CHART_HISTORY_HOURS,
+    CONF_CHART_INTERVAL,
     CONF_CHART_LINE_WIDTH,
     CONF_CHART_MAX,
     CONF_CHART_MIN,
@@ -142,18 +145,19 @@ CHART_SERIES_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_CHART_ENTITY): cv.entity_id,
         vol.Optional(CONF_CHART_COLOR, default="#ffffff"): cv.string,
-        vol.Optional(CONF_CHART_HISTORY_HOURS, default=1): vol.All(
-            vol.Coerce(float), vol.Range(min=0.1, max=168)
-        ),
     }
 )
 
 CHART_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_CHART_SERIES): vol.All(cv.ensure_list, [CHART_SERIES_SCHEMA]),
+        vol.Optional(CONF_CHART_HISTORY_HOURS, default=1): vol.All(
+            vol.Coerce(float), vol.Range(min=0.1, max=168)
+        ),
         vol.Optional(CONF_CHART_TYPE): vol.All(int, vol.Range(min=0, max=2)),
         vol.Optional(CONF_CHART_MIN): vol.Coerce(float),
         vol.Optional(CONF_CHART_MAX): vol.Coerce(float),
+        vol.Optional(CONF_CHART_INTERVAL): vol.All(vol.Coerce(float), vol.Range(min=0.5, max=1440)),
         vol.Optional(CONF_CHART_SCALE, default=1.0): vol.Coerce(float),
         vol.Optional(CONF_CHART_POINT_COUNT): vol.All(int, vol.Range(min=1, max=1000)),
         vol.Optional(CONF_CHART_GRID_COLOR): cv.string,
@@ -774,6 +778,31 @@ class SwitchPlate(RestoreEntity):
             )
 
 
+def _resample_history(timed_values, start_time, end_time, n_points):
+    """Resample (datetime, float) pairs to n evenly-spaced time-bucket values.
+
+    Uses last-known-value carry-forward, which is correct for sensor data.
+    """
+    if not timed_values or n_points <= 0:
+        return []
+
+    total_seconds = (end_time - start_time).total_seconds()
+    bucket_size = total_seconds / n_points
+
+    result = []
+    last_value = timed_values[0][1]
+    state_idx = 0
+
+    for i in range(n_points):
+        bucket_end = start_time + timedelta(seconds=(i + 1) * bucket_size)
+        while state_idx < len(timed_values) and timed_values[state_idx][0] <= bucket_end:
+            last_value = timed_values[state_idx][1]
+            state_idx += 1
+        result.append(last_value)
+
+    return result
+
+
 class HASPChart:
     """Representation of an openHASP chart object fed by HA entity history."""
 
@@ -789,6 +818,8 @@ class HASPChart:
         self._scale = chart_cfg.get(CONF_CHART_SCALE, 1.0)
         self._chart_min = chart_cfg.get(CONF_CHART_MIN)
         self._chart_max = chart_cfg.get(CONF_CHART_MAX)
+        self._history_hours = chart_cfg.get(CONF_CHART_HISTORY_HOURS, 1)
+        self._interval_minutes = chart_cfg.get(CONF_CHART_INTERVAL)
         self._point_count = chart_cfg.get(CONF_CHART_POINT_COUNT)
         self._visual = {
             k: chart_cfg[k]
@@ -811,35 +842,64 @@ class HASPChart:
         await self._send_visual_config()
         await self._send_history()
 
-        for idx, series in enumerate(self._series):
-            entity_id = series[CONF_CHART_ENTITY]
-
-            def _make_listener(ser_idx):
-                @callback
-                async def _state_changed(event):
-                    new_state = event.data.get("new_state")
-                    if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-                        return
-                    try:
-                        value = round(float(new_state.state), 2)
-                    except (ValueError, TypeError):
-                        return
-                    append_payload = {"ser": ser_idx, "val": value}
-                    if self._scale != 1.0:
-                        append_payload["scale"] = self._scale
-                    _LOGGER.debug("Chart %s append ser=%d val=%s", self.obj_id, ser_idx, value)
-                    await async_publish(self.hass, self.command_topic + "append", json.dumps(append_payload), qos=0, retain=False)
-                return _state_changed
-
+        if self._interval_minutes is not None:
             self._subscriptions.append(
-                async_track_state_change_event(self.hass, [entity_id], _make_listener(idx))
+                async_track_time_interval(
+                    self.hass,
+                    self._interval_append,
+                    timedelta(minutes=self._interval_minutes),
+                )
             )
+        else:
+            for idx, series in enumerate(self._series):
+                entity_id = series[CONF_CHART_ENTITY]
+
+                def _make_listener(ser_idx):
+                    @callback
+                    async def _state_changed(event):
+                        new_state = event.data.get("new_state")
+                        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                            return
+                        try:
+                            value = round(float(new_state.state), 2)
+                        except (ValueError, TypeError):
+                            return
+                        append_payload = {"ser": ser_idx, "val": value}
+                        if self._scale != 1.0:
+                            append_payload["scale"] = self._scale
+                        _LOGGER.debug("Chart %s append ser=%d val=%s", self.obj_id, ser_idx, value)
+                        await async_publish(self.hass, self.command_topic + "append", json.dumps(append_payload), qos=0, retain=False)
+                    return _state_changed
+
+                self._subscriptions.append(
+                    async_track_state_change_event(self.hass, [entity_id], _make_listener(idx))
+                )
 
     async def disable_object(self):
         """Remove state subscriptions."""
         for unsub in self._subscriptions:
             unsub()
         self._subscriptions = []
+
+    @callback
+    async def _interval_append(self, _now):
+        """Sample all series at each interval tick and append to the chart."""
+        for ser_idx, series in enumerate(self._series):
+            entity_id = series[CONF_CHART_ENTITY]
+            state = self.hass.states.get(entity_id)
+            if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                continue
+            try:
+                value = round(float(state.state), 2)
+            except (ValueError, TypeError):
+                continue
+            append_payload = {"ser": ser_idx, "val": value}
+            if self._scale != 1.0:
+                append_payload["scale"] = self._scale
+            _LOGGER.debug("Chart %s interval append ser=%d val=%s", self.obj_id, ser_idx, value)
+            await async_publish(
+                self.hass, self.command_topic + "append", json.dumps(append_payload), qos=0, retain=False
+            )
 
     async def refresh(self):
         """Re-send visual config and full history when plate reconnects."""
@@ -888,35 +948,61 @@ class HASPChart:
             await self._send_current_state()
             return
 
-        for idx, series in enumerate(self._series):
+        now = dt_util.utcnow()
+
+        common_start = now - timedelta(hours=self._history_hours)
+
+        # Collect (timestamp, value) pairs per series.
+        raw_series = []
+        for series in self._series:
             entity_id = series[CONF_CHART_ENTITY]
-            hours = series[CONF_CHART_HISTORY_HOURS]
-            start = dt_util.utcnow() - timedelta(hours=hours)
 
             try:
                 states = await get_instance(self.hass).async_add_executor_job(
                     get_significant_states,
                     self.hass,
-                    start,
+                    common_start,
                     None,
                     [entity_id],
                 )
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.error("Error fetching history for %s: %s", entity_id, err)
+                raw_series.append([])
                 continue
 
-            values = []
+            timed_values = []
             for state in states.get(entity_id, []):
                 try:
-                    values.append(round(float(state.state), 2))
+                    timed_values.append((state.last_changed, round(float(state.state), 2)))
                 except (ValueError, TypeError):
                     pass
+            raw_series.append(timed_values)
 
-            if not values:
-                _LOGGER.debug("No history for %s (series %d)", entity_id, idx)
+        # Determine target point count — interval takes priority, then point_count, then min raw.
+        if self._interval_minutes is not None:
+            n_points = math.ceil(self._history_hours * 60 / self._interval_minutes)
+        elif self._point_count is not None:
+            n_points = self._point_count
+        else:
+            lengths = [len(s) for s in raw_series if s]
+            n_points = min(lengths) if lengths else 0
+
+        if n_points == 0:
+            return
+
+        for idx, (series, timed_values) in enumerate(zip(self._series, raw_series)):
+            if not timed_values:
+                _LOGGER.debug("No history for series %d", idx)
                 continue
 
-            data_payload = {"ser": idx, "data": values}
+            values = _resample_history(timed_values, common_start, now, n_points)
+
+            data_payload = {
+                "ser": idx,
+                "t_start": int(common_start.timestamp()),
+                "t_step": int(self._interval_minutes * 60) if self._interval_minutes else 0,
+                "data": values,
+            }
             if self._scale != 1.0:
                 data_payload["scale"] = self._scale
             if self._chart_min is not None:
