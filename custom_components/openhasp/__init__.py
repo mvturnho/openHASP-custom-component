@@ -864,7 +864,7 @@ class HASPChart:
                             value = round(float(new_state.state), 2)
                         except (ValueError, TypeError):
                             return
-                        append_payload = {"ser": ser_idx, "val": value}
+                        append_payload = {"ser": ser_idx, "t": int(dt_util.utcnow().timestamp()), "value": value}
                         if self._scale != 1.0:
                             append_payload["scale"] = self._scale
                         _LOGGER.debug("Chart %s append ser=%d val=%s", self.obj_id, ser_idx, value)
@@ -893,7 +893,7 @@ class HASPChart:
                 value = round(float(state.state), 2)
             except (ValueError, TypeError):
                 continue
-            append_payload = {"ser": ser_idx, "val": value}
+            append_payload = {"ser": ser_idx, "t": int(dt_util.utcnow().timestamp()), "value": value}
             if self._scale != 1.0:
                 append_payload["scale"] = self._scale
             _LOGGER.debug("Chart %s interval append ser=%d val=%s", self.obj_id, ser_idx, value)
@@ -997,10 +997,15 @@ class HASPChart:
 
             values = _resample_history(timed_values, common_start, now, n_points)
 
+            t_step_seconds = int(self._interval_minutes * 60) if self._interval_minutes else 0
+            # Each resampled point represents the END of its bucket, so values[0] is at
+            # common_start + t_step and values[-1] is at now.  Send t_start = common_start + t_step
+            # so that firmware label[i] = t_start + i*t_step, and the last label equals now.
+            t_start_ts = int(common_start.timestamp()) + t_step_seconds
             data_payload = {
                 "ser": idx,
-                "t_start": int(common_start.timestamp()),
-                "t_step": int(self._interval_minutes * 60) if self._interval_minutes else 0,
+                "t_start": t_start_ts,
+                "t_step": t_step_seconds,
                 "data": values,
             }
             if self._scale != 1.0:
