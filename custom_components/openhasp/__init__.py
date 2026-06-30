@@ -41,6 +41,7 @@ import jsonschema
 import voluptuous as vol
 
 from .chart import CHART_SCHEMA, HASPChart
+from .dataset import DATASETS_SCHEMA, HASPDataset
 from .common import HASP_IDLE_SCHEMA
 from .const import (
     ATTR_COMMAND_KEYWORD,
@@ -58,6 +59,7 @@ from .const import (
     ATTR_WIDTH,
     CONF_CHART,
     CONF_COMPONENT,
+    CONF_DATASETS,
     CONF_EVENT,
     CONF_HWID,
     CONF_OBJECTS,
@@ -137,7 +139,8 @@ OBJECT_SCHEMA = vol.Schema(
 
 PLATE_SCHEMA = vol.Schema(
     {
-        vol.Optional(CONF_OBJECTS): vol.All(cv.ensure_list, [OBJECT_SCHEMA]),
+        vol.Optional(CONF_OBJECTS, default=[]): vol.All(cv.ensure_list, [OBJECT_SCHEMA]),
+        vol.Optional(CONF_DATASETS, default=[]): DATASETS_SCHEMA,
     },
 )
 
@@ -368,12 +371,14 @@ class SwitchPlate(RestoreEntity):
         )
 
         self._objects = []
-        for obj in config[CONF_OBJECTS]:
+        for obj in config.get(CONF_OBJECTS, []):
             if CONF_CHART in obj:
                 new_obj = HASPChart(hass, self._topic, obj)
             else:
                 new_obj = HASPObject(hass, self._topic, obj)
             self._objects.append(new_obj)
+        for dataset_cfg in config.get(CONF_DATASETS, []):
+            self._objects.append(HASPDataset(hass, self._topic, dataset_cfg))
         self._statusupdate = {HASP_NUM_PAGES: entry.data[CONF_PAGES]}
         self._available = False
         self._page = 1

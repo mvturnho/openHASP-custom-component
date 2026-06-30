@@ -50,6 +50,15 @@ CONF_CHART_SCALE = "scale"
 CONF_CHART_Y_LABEL = "y_label"
 CONF_CHART_SHOW_SCALE = "show_scale"
 
+# Dataset config keys
+CONF_DATASETS = "datasets"
+CONF_DATASET_ID = "id"
+CONF_DATASET_NAME = "name"
+CONF_DATASET_HISTORY_HOURS = "history_hours"
+CONF_DATASET_INTERVAL = "interval"
+CONF_DATASET_SERIES = "series"
+CONF_DATASET_SERIES_ENTITY = "entity"
+
 
 DATA_LISTENER = "listener"
 DATA_IMAGES = "images"
