@@ -17,6 +17,7 @@ import homeassistant.components.mqtt as mqtt
 from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
 from homeassistant.components.button import DOMAIN as BUTTON_DOMAIN
 from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
+from homeassistant.components.media_player import DOMAIN as MEDIA_PLAYER_DOMAIN
 from homeassistant.components.number import DOMAIN as NUMBER_DOMAIN
 from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
 from homeassistant.const import CONF_NAME, STATE_UNAVAILABLE, STATE_UNKNOWN
@@ -42,7 +43,11 @@ import voluptuous as vol
 
 from .chart import CHART_SCHEMA, HASPChart
 from .dataset import DATASETS_SCHEMA, HASPDataset
-from .common import HASP_IDLE_SCHEMA
+from .common import (
+    HASP_IDLE_SCHEMA,
+    async_update_plate_availability,
+    plate_availability,
+)
 from .const import (
     ATTR_COMMAND_KEYWORD,
     ATTR_COMMAND_PARAMETERS,
@@ -71,6 +76,7 @@ from .const import (
     CONF_TOPIC,
     CONF_TRACK,
     CONF_SUBTOPIC,
+    DATA_AVAILABILITY,
     DATA_IMAGES,
     DATA_LISTENER,
     DISCOVERED_MANUFACTURER,
@@ -111,6 +117,7 @@ PLATFORMS = [
     BINARY_SENSOR_DOMAIN,
     NUMBER_DOMAIN,
     BUTTON_DOMAIN,
+    MEDIA_PLAYER_DOMAIN,
 ]
 
 
@@ -198,7 +205,7 @@ async def async_setup(hass, config):
         )
         return False
 
-    hass.data[DOMAIN] = {CONF_PLATE: {}}
+    hass.data[DOMAIN] = {CONF_PLATE: {}, DATA_AVAILABILITY: {}}
 
     component = hass.data[DOMAIN][CONF_COMPONENT] = EntityComponent(_LOGGER, DOMAIN, hass)
 
@@ -508,12 +515,46 @@ class SwitchPlate(RestoreEntity):
         @callback
         async def lwt_message_received(msg):
             """Process LWT."""
-            _LOGGER.debug("Received LWT = %s", msg.payload)
+            hwid = self._entry.data[CONF_HWID]
+            # TEMP DEBUG: msg.retain distinguishes the broker replaying the
+            # retained LWT at subscribe time from a live transition.
+            _LOGGER.debug(
+                "Received LWT on %s = %r (retained=%s, hwid=%s)",
+                msg.topic,
+                msg.payload,
+                msg.retain,
+                hwid,
+            )
             try:
                 message = HASP_LWT_SCHEMA(msg.payload)
 
+                # Latch it centrally BEFORE firing, so an entity that is added
+                # later can read the current state. The retained LWT is
+                # delivered only once and this callback is normally reached
+                # before the platform entities exist, which is why the event
+                # alone is not enough.
+                online_now = message == HASP_ONLINE
+                async_update_plate_availability(self.hass, hwid, online_now)
+                # TEMP DEBUG: proves the latch was updated and to what.
+                _LOGGER.debug(
+                    "LWT interpreted as %s, latch[%s] = %s",
+                    "ONLINE" if online_now else "OFFLINE",
+                    hwid,
+                    plate_availability(self.hass, hwid),
+                )
+
                 if message == HASP_ONLINE:
                     self._available = True
+                    # TEMP DEBUG: listener count at fire time. Zero proves the
+                    # event reached nobody and only the latch saves the entities.
+                    _LOGGER.debug(
+                        "Firing %s for %s (%d listener(s))",
+                        EVENT_HASP_PLATE_ONLINE,
+                        hwid,
+                        self.hass.bus.async_listeners().get(
+                            EVENT_HASP_PLATE_ONLINE, 0
+                        ),
+                    )
                     self.hass.bus.async_fire(
                         EVENT_HASP_PLATE_ONLINE,
                         {CONF_PLATE: self._entry.data[CONF_HWID]},
@@ -539,8 +580,12 @@ class SwitchPlate(RestoreEntity):
             except vol.error.Invalid as err:
                 _LOGGER.error("While processing LWT: %s", err)
 
+        lwt_topic = f"{self._topic}/LWT"
+        # TEMP DEBUG: confirms the exact LWT topic subscribed to, and that this
+        # happens before the platform entities are created.
+        _LOGGER.debug("Subscribing to LWT topic %s", lwt_topic)
         self._subscriptions.append(
-            await async_subscribe(self.hass, f"{self._topic}/LWT", lwt_message_received)
+            await async_subscribe(self.hass, lwt_topic, lwt_message_received)
         )
 
     @property

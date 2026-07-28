@@ -62,6 +62,10 @@ CONF_DATASET_SERIES_ENTITY = "entity"
 
 DATA_LISTENER = "listener"
 DATA_IMAGES = "images"
+# Central per-plate online/offline latch, keyed by hardware id. See
+# common.async_update_plate_availability for why a latch is needed next to the
+# online/offline events.
+DATA_AVAILABILITY = "availability"
 
 DEFAULT_TOPIC = "hasp"
 DEFAULT_PATH = "pages.jsonl"
