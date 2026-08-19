@@ -115,7 +115,7 @@ push_image:
         text:
     obj:
       name: Object
-      description: Object ID in the format p#b##
+      description: Object ID in the format p#b## (object) or p#c## (connection)
       required: true
       example: "p1b10"
       selector:

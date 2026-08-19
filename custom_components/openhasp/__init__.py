@@ -43,6 +43,14 @@ import voluptuous as vol
 
 from .chart import CHART_SCHEMA, HASPChart
 from .dataset import DATASETS_SCHEMA, HASPDataset
+from .ring_segment import (
+    RING_SEGMENT_PROPERTY,
+    RingSegmentValueError,
+    build_ring_segment_command,
+    hasp_property_key,
+    is_ring_segment_path,
+    parse_ring_segment_path,
+)
 from .common import (
     HASP_IDLE_SCHEMA,
     async_update_plate_availability,
@@ -121,17 +129,25 @@ PLATFORMS = [
 ]
 
 
+# Canonical openHASP object reference: p<page><kind><id>
+# 'b' is the historical/generic object notation, 'c' addresses a connection.
+OBJECT_REF_PATTERN = re.compile("p[0-9]+[bc][0-9]+")
+
+
 def hasp_object(value):
     """Validade HASP-LVGL object format."""
-    if re.match("p[0-9]+b[0-9]+", value):
+    if isinstance(value, str) and OBJECT_REF_PATTERN.fullmatch(value):
         return value
-    raise vol.Invalid("Not an HASP-LVGL object p#b#")
+    raise vol.Invalid(
+        f"'{value}' is not a valid HASP-LVGL object reference, "
+        "expected p<page>b<id> (object) or p<page>c<id> (connection)"
+    )
 
 
 # Configuration YAML schemas
 EVENT_SCHEMA = cv.schema_with_slug_keys(cv.SCRIPT_SCHEMA)
 
-PROPERTY_SCHEMA = cv.schema_with_slug_keys(cv.template)
+PROPERTY_SCHEMA = cv.schema_with_slug_keys(cv.template, slug_validator=hasp_property_key)
 
 OBJECT_SCHEMA = vol.Schema(
     {
@@ -866,7 +882,7 @@ class HASPObject:
                 result,
             )
 
-            await async_publish(self.hass, self.command_topic + _property, result)
+            await self.async_publish_property(_property, result)
 
         property_template = async_track_template_result(
             self.hass,
@@ -877,11 +893,45 @@ class HASPObject:
 
         return property_template
 
+    def _property_command(self, _property, result):
+        """Map a configuration property path and rendered value onto the wire.
+
+        Returns a (wire property, payload) tuple, or None when the value must
+        not be sent to the plate.  Ordinary properties are passed through
+        unchanged; only ``ring_segment.<segment-id>.<field>`` paths are
+        translated into a partial ``ring_segment`` object payload.
+        """
+        if not is_ring_segment_path(_property):
+            return _property, result
+
+        path = parse_ring_segment_path(_property)
+        try:
+            command = build_ring_segment_command(path, result)
+        except RingSegmentValueError as err:
+            _LOGGER.debug(
+                "%s %s - not sending '%s': %s", self.obj_id, _property, result, err
+            )
+            return None
+
+        return RING_SEGMENT_PROPERTY, json.dumps(command[RING_SEGMENT_PROPERTY])
+
+    async def async_publish_property(self, _property, result):
+        """Send a single property binding to the plate."""
+        command = self._property_command(_property, result)
+        if command is None:
+            return
+
+        wire_property, payload = command
+        if wire_property != _property:
+            _LOGGER.debug("%s %s -> %s", self.obj_id, _property, payload)
+
+        await async_publish(self.hass, self.command_topic + wire_property, payload)
+
     async def refresh(self):
         """Refresh based on cached values."""
         for _property, result in self.cached_properties.items():
             _LOGGER.debug("Refresh object %s.%s = %s", self.obj_id, _property, result)
-            await async_publish(self.hass, self.command_topic + _property, result)
+            await self.async_publish_property(_property, result)
 
     async def async_listen_hasp_events(self):
         """Listen to messages on MQTT for HASP events."""
