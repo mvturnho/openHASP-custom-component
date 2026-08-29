@@ -44,6 +44,28 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def canonical_plate_id(discovered):
+    """Return the stable canonical identity for a discovered plate."""
+    hwid = discovered.get(DISCOVERED_HWID)
+    if hwid is None:
+        raise data_entry_flow.AbortFlow("invalid_discovery_info")
+
+    hwid = str(hwid).strip().lower()
+    if not hwid:
+        raise data_entry_flow.AbortFlow("invalid_discovery_info")
+
+    return hwid
+
+
+def discovery_entry_updates(discovered):
+    """Return dynamic config entry data from a discovery payload."""
+    return {
+        key: value
+        for key in (CONF_TOPIC, DISCOVERED_URL)
+        if (value := discovered.get(key)) is not None
+    }
+
+
 def validate_jsonl(path):
     """Validate that the value is an existing file."""
     if path is None:
@@ -72,6 +94,19 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_RELAYS: [],
         }
 
+    def _async_entry_for_plate_id(self, plate_id):
+        """Return an existing config entry matching a canonical plate id."""
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            try:
+                entry_plate_id = canonical_plate_id(entry.data)
+            except data_entry_flow.AbortFlow:
+                continue
+
+            if entry_plate_id == plate_id:
+                return entry
+
+        return None
+
     async def async_step_user(self, user_input=None):
         """Handle a flow initialized by User."""
         _LOGGER.info("Discovery Only")
@@ -87,7 +122,7 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_abort(reason="discovery_only")
 
     async def async_step_zeroconf(self, discovery_info=None):
-        _discovered = discovery_info.properties
+        _discovered = dict(discovery_info.properties)
         _LOGGER.debug("Discovered ZeroConf: %s", _discovered)
 
         _discovered[CONF_TOPIC] = _discovered[DISCOVERED_NODE_T][:-1]
@@ -121,10 +156,18 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         return await self._process_discovery(_discovered)
 
     async def _process_discovery(self, _discovered):
-        await self.async_set_unique_id(
-            _discovered[DISCOVERED_HWID], raise_on_progress=False
-        )
-        self._abort_if_unique_id_configured()
+        plate_id = canonical_plate_id(_discovered)
+        updates = discovery_entry_updates(_discovered)
+
+        if entry := self._async_entry_for_plate_id(plate_id):
+            if updates:
+                self.hass.config_entries.async_update_entry(
+                    entry, data={**entry.data, **updates}
+                )
+            return self.async_abort(reason="already_configured")
+
+        await self.async_set_unique_id(plate_id)
+        self._abort_if_unique_id_configured(updates=updates)
 
         version = _discovered.get(DISCOVERED_VERSION)
         if version.split(".")[0:2] != [MAJOR, MINOR]:
@@ -137,7 +180,7 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         self.config_data[DISCOVERED_VERSION] = version
 
-        self.config_data[CONF_HWID] = _discovered[DISCOVERED_HWID]
+        self.config_data[CONF_HWID] = plate_id
         self.config_data[CONF_NODE] = self.config_data[CONF_NAME] = _discovered[
             DISCOVERED_NODE
         ]
@@ -167,34 +210,33 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self.config_data = {**self.config_data, **user_input}
 
-            if self.config_data[
-                CONF_NAME
-            ] not in self.hass.config_entries.async_entries(DOMAIN):
-                # Remove / from base topic
-                if user_input[CONF_TOPIC].endswith("/"):
-                    user_input[CONF_TOPIC] = user_input[CONF_TOPIC][:-1]
+            # Remove / from base topic
+            if user_input[CONF_TOPIC].endswith("/"):
+                user_input[CONF_TOPIC] = user_input[CONF_TOPIC][:-1]
+                self.config_data[CONF_TOPIC] = user_input[CONF_TOPIC]
 
-                try:
-                    valid_subscribe_topic(self.config_data[CONF_TOPIC])
+            try:
+                valid_subscribe_topic(self.config_data[CONF_TOPIC])
 
-                    if CONF_PAGES_PATH in user_input:
-                        self.config_data[CONF_PAGES_PATH] = validate_jsonl(
-                            user_input[CONF_PAGES_PATH]
-                        )
-
-                    await self.async_set_unique_id(self.config_data[CONF_HWID])
-
-                    return self.async_create_entry(
-                        title=user_input[CONF_NAME], data=self.config_data
+                if CONF_PAGES_PATH in user_input:
+                    self.config_data[CONF_PAGES_PATH] = validate_jsonl(
+                        user_input[CONF_PAGES_PATH]
                     )
 
-                except vol.Invalid:
-                    return self.async_abort(reason="invalid_discovery_info")
+                await self.async_set_unique_id(
+                    canonical_plate_id(self.config_data)
+                )
+                self._abort_if_unique_id_configured()
 
-                except InvalidJSONL:
-                    self._errors[CONF_PAGES_PATH] = "invalid_jsonl_path"
-            else:
-                self._errors[CONF_NAME] = "name_exists"
+                return self.async_create_entry(
+                    title=user_input[CONF_NAME], data=self.config_data
+                )
+
+            except vol.Invalid:
+                return self.async_abort(reason="invalid_discovery_info")
+
+            except InvalidJSONL:
+                self._errors[CONF_PAGES_PATH] = "invalid_jsonl_path"
 
         return self.async_show_form(
             step_id="personalize",
