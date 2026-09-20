@@ -71,17 +71,33 @@ def _resample_history(timed_values, start_time, end_time, n_points):
 class HASPDataset:
     """Publishes firmware Dataset Replace commands from Home Assistant entity history."""
 
-    def __init__(self, hass, plate_topic, config):
+    def __init__(self, hass, plate_topic, config, plate_name=None):
         self.hass = hass
+        self._plate_name = plate_name
         self._dataset_id = config[CONF_DATASET_ID]
         self._history_hours = config[CONF_DATASET_HISTORY_HOURS]
         self._interval_seconds = config[CONF_DATASET_INTERVAL]
         self._series = config[CONF_DATASET_SERIES]
         self._replace_topic = f"{plate_topic}/command/d{self._dataset_id}.replace"
         self._subscriptions = []
+        self._enabled = False
+        _LOGGER.debug(
+            "HASPDataset created plate=%s topic=%s dataset_id=%s",
+            self._plate_name,
+            plate_topic,
+            self._dataset_id,
+        )
 
     async def enable_object(self):
         """Bootstrap history and schedule periodic updates."""
+        if self._enabled:
+            return
+
+        # This is the single owner of the initial publish when a plate comes
+        # online. SwitchPlate.refresh() runs before enable_object() in the LWT
+        # path, so refresh() deliberately does nothing until the dataset is
+        # active.
+        self._enabled = True
         await self._send_history()
         self._subscriptions.append(
             async_track_time_interval(
@@ -93,12 +109,15 @@ class HASPDataset:
 
     async def disable_object(self):
         """Cancel all scheduled updates."""
+        self._enabled = False
         for unsub in self._subscriptions:
             unsub()
         self._subscriptions = []
 
     async def refresh(self):
         """Re-send full history (called on plate reconnect)."""
+        if not self._enabled:
+            return
         await self._send_history()
 
     async def _interval_update(self, _now):
@@ -129,6 +148,9 @@ class HASPDataset:
         t_start_ts = int(t_start_dt.timestamp()) + t_step
 
         for ser_idx, series in enumerate(self._series):
+            if not self._enabled:
+                return
+
             entity_id = series[CONF_DATASET_SERIES_ENTITY]
 
             if self.hass.states.get(entity_id) is None:
@@ -187,6 +209,15 @@ class HASPDataset:
                 self._dataset_id,
                 ser_idx,
                 len(values),
+            )
+            if not self._enabled:
+                return
+            _LOGGER.debug(
+                "publish %s plate=%s topic=%s dataset_id=%s",
+                self._replace_topic,
+                self._plate_name,
+                self._replace_topic.rsplit("/command/", 1)[0],
+                self._dataset_id,
             )
             await async_publish(
                 self.hass, self._replace_topic, json.dumps(payload), qos=0, retain=False

@@ -66,6 +66,7 @@ DATA_IMAGES = "images"
 # common.async_update_plate_availability for why a latch is needed next to the
 # online/offline events.
 DATA_AVAILABILITY = "availability"
+DATA_TOPIC_OWNERS = "topic_owners"
 
 DEFAULT_TOPIC = "hasp"
 DEFAULT_PATH = "pages.jsonl"

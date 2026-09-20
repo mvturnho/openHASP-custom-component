@@ -56,6 +56,13 @@ from .common import (
     async_update_plate_availability,
     plate_availability,
 )
+from .config_flow import (
+    async_recover_discovered_owner,
+    canonical_plate_id,
+    log_topic_collision,
+    normalize_mqtt_topic,
+    topic_entries,
+)
 from .const import (
     ATTR_COMMAND_KEYWORD,
     ATTR_COMMAND_PARAMETERS,
@@ -72,6 +79,7 @@ from .const import (
     ATTR_WIDTH,
     CONF_CHART,
     CONF_COMPONENT,
+    CONF_DATASET_ID,
     CONF_DATASETS,
     CONF_EVENT,
     CONF_HWID,
@@ -87,6 +95,7 @@ from .const import (
     DATA_AVAILABILITY,
     DATA_IMAGES,
     DATA_LISTENER,
+    DATA_TOPIC_OWNERS,
     DISCOVERED_MANUFACTURER,
     DISCOVERED_MODEL,
     DISCOVERED_URL,
@@ -221,7 +230,11 @@ async def async_setup(hass, config):
         )
         return False
 
-    hass.data[DOMAIN] = {CONF_PLATE: {}, DATA_AVAILABILITY: {}}
+    hass.data[DOMAIN] = {
+        CONF_PLATE: {},
+        DATA_AVAILABILITY: {},
+        DATA_TOPIC_OWNERS: {},
+    }
 
     component = hass.data[DOMAIN][CONF_COMPONENT] = EntityComponent(_LOGGER, DOMAIN, hass)
 
@@ -290,10 +303,65 @@ async def async_update_options(hass, entry):
     await hass.config_entries.async_reload(entry.entry_id)
 
 
+def _active_topic_owner(hass, topic, entry_id):
+    """Return the active plate using a normalized MQTT topic."""
+    normalized_topic = normalize_mqtt_topic(topic)
+    for plate_entity in hass.data[DOMAIN][CONF_PLATE].values():
+        if plate_entity._entry.entry_id == entry_id:
+            continue
+        if normalize_mqtt_topic(plate_entity._topic) == normalized_topic:
+            return plate_entity
+    return None
+
+
 async def async_setup_entry(hass, entry) -> bool:
     """Set up OpenHASP via a config entry."""
+    if entry.disabled_by is not None:
+        return False
+
     plate = entry.data[CONF_NAME]
+    topic = normalize_mqtt_topic(entry.data.get(CONF_TOPIC))
+    plate_id = canonical_plate_id(entry.data)
     _LOGGER.debug("Setup %s", plate)
+
+    authoritative_hwid = hass.data[DOMAIN][DATA_TOPIC_OWNERS].get(topic)
+    if authoritative_hwid and authoritative_hwid != plate_id:
+        await async_recover_discovered_owner(
+            hass, authoritative_hwid, topic
+        )
+        _LOGGER.error(
+            "Not setting up stale entry_id=%s for topic %s; discovered owner "
+            "is hwid=%s",
+            entry.entry_id,
+            topic,
+            authoritative_hwid,
+        )
+        return False
+
+    if not authoritative_hwid and len(topic_entries(hass, topic)) > 1:
+        _LOGGER.error(
+            "Not setting up entry_id=%s because stored MQTT topic %s has no "
+            "authoritative owner yet; waiting for discovery",
+            entry.entry_id,
+            topic,
+        )
+        return False
+
+    active_owner = _active_topic_owner(hass, topic, entry.entry_id)
+    if active_owner:
+        log_topic_collision(
+            entry.entry_id,
+            entry.data.get(CONF_HWID),
+            plate,
+            topic,
+            active_owner._entry,
+        )
+        _LOGGER.error(
+            "Not setting up entry_id=%s because MQTT topic %s is already active",
+            entry.entry_id,
+            topic,
+        )
+        return False
 
     hass_config = await async_integration_yaml_config(hass, DOMAIN)
 
@@ -307,6 +375,25 @@ async def async_setup_entry(hass, entry) -> bool:
         return False
 
     config = hass_config[DOMAIN][slugify(plate)]
+
+    # Re-check immediately before reserving the runtime slot. The YAML load
+    # above is asynchronous, so another entry may have claimed the topic in
+    # the meantime.
+    active_owner = _active_topic_owner(hass, topic, entry.entry_id)
+    if active_owner:
+        log_topic_collision(
+            entry.entry_id,
+            entry.data.get(CONF_HWID),
+            plate,
+            topic,
+            active_owner._entry,
+        )
+        _LOGGER.error(
+            "Not setting up entry_id=%s because MQTT topic %s is already active",
+            entry.entry_id,
+            topic,
+        )
+        return False
 
     # Register Plate device
     device_registry = dr.async_get(hass)
@@ -324,8 +411,8 @@ async def async_setup_entry(hass, entry) -> bool:
     # Add entity to component
     component = hass.data[DOMAIN][CONF_COMPONENT]
     plate_entity = SwitchPlate(hass, config, entry)
+    hass.data[DOMAIN][CONF_PLATE][entry.entry_id] = plate_entity
     await component.async_add_entities([plate_entity])
-    hass.data[DOMAIN][CONF_PLATE][plate] = plate_entity
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -345,19 +432,18 @@ async def async_unload_entry(hass, entry):
         await hass.config_entries.async_forward_entry_unload(entry, domain)
 
     component = hass.data[DOMAIN][CONF_COMPONENT]
-    await component.async_remove_entity(hass.data[DOMAIN][CONF_PLATE][plate].entity_id)
-
-    # Remove Plate entity
-    del hass.data[DOMAIN][CONF_PLATE][plate]
+    plate_entity = hass.data[DOMAIN][CONF_PLATE].pop(entry.entry_id, None)
+    if plate_entity is not None:
+        await component.async_remove_entity(plate_entity.entity_id)
 
     return True
 
 
 async def async_remove_entry(hass, entry):
-    plate = entry.data[CONF_NAME]
+    plate_entity = hass.data[DOMAIN][CONF_PLATE].pop(entry.entry_id, None)
 
     # Only remove services if it is the last
-    if len(hass.data[DOMAIN][CONF_PLATE]) == 1:
+    if not hass.data[DOMAIN][CONF_PLATE]:
         _LOGGER.debug("removing services")
         hass.services.async_remove(DOMAIN, SERVICE_WAKEUP)
         hass.services.async_remove(DOMAIN, SERVICE_PAGE_NEXT)
@@ -371,13 +457,19 @@ async def async_remove_entry(hass, entry):
     dev = device_registry.async_get_device(
         identifiers={(DOMAIN, entry.data[CONF_HWID])}
     )
-    if entry.entry_id in dev.config_entries:
+    if dev and entry.entry_id in dev.config_entries:
         _LOGGER.debug("Removing device %s", dev)
         device_registry.async_remove_device(dev.id)
 
     # Component does not remove entity from entity_registry, so we must do it
     registry = entity_registry.async_get(hass)
-    registry.async_remove(hass.data[DOMAIN][CONF_PLATE][plate].entity_id)
+    entity_id = (
+        plate_entity.entity_id
+        if plate_entity is not None
+        else registry.async_get_entity_id(DOMAIN, DOMAIN, entry.data[CONF_HWID])
+    )
+    if entity_id:
+        registry.async_remove(entity_id)
 
 
 # pylint: disable=R0902
@@ -388,7 +480,7 @@ class SwitchPlate(RestoreEntity):
         """Initialize a plate."""
         super().__init__()
         self._entry = entry
-        self._topic = entry.data[CONF_TOPIC]
+        self._topic = normalize_mqtt_topic(entry.data[CONF_TOPIC])
         self._pages_jsonl = entry.options.get(
             CONF_PAGES_PATH, entry.data.get(CONF_PAGES_PATH)
         )
@@ -400,8 +492,23 @@ class SwitchPlate(RestoreEntity):
             else:
                 new_obj = HASPObject(hass, self._topic, obj)
             self._objects.append(new_obj)
-        for dataset_cfg in config.get(CONF_DATASETS, []):
-            self._objects.append(HASPDataset(hass, self._topic, dataset_cfg))
+        dataset_configs = config.get(CONF_DATASETS, [])
+        _LOGGER.debug(
+            "SwitchPlate construct entry_id=%s plate=%s topic=%s datasets=%s",
+            entry.entry_id,
+            entry.data[CONF_NAME],
+            self._topic,
+            [dataset_cfg[CONF_DATASET_ID] for dataset_cfg in dataset_configs],
+        )
+        for dataset_cfg in dataset_configs:
+            self._objects.append(
+                HASPDataset(
+                    hass,
+                    self._topic,
+                    dataset_cfg,
+                    plate_name=entry.data[CONF_NAME],
+                )
+            )
         self._statusupdate = {HASP_NUM_PAGES: entry.data[CONF_PAGES]}
         self._available = False
         self._page = 1

@@ -6,7 +6,6 @@
                 "description": "Don't forget to add your plate to YAML configuration",
                 "data": {
                     "name": "Name of the plate",
-                    "topic": "OpenHASP MQTT base topic",
                     "idle_brightness": "Brightness level when plate is idle",
                     "path": "Full path to the JSONL file"
                 }
@@ -19,6 +18,7 @@
         },
         "abort": {
             "already_configured": "Plate already configured",
+            "topic_collision": "MQTT topic is already used by another plate",
             "mismatch_version": "Plate firmware mismatch",
             "discovery_only": "Configuration is done through discovery"
         }

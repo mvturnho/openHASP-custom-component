@@ -5,6 +5,7 @@ import os
 
 from homeassistant.components.mqtt import async_publish
 from homeassistant import config_entries, data_entry_flow, exceptions
+from homeassistant.config_entries import ConfigEntryDisabler
 from homeassistant.components.mqtt import valid_subscribe_topic
 from homeassistant.const import CONF_NAME
 from homeassistant.core import callback
@@ -20,10 +21,11 @@ from .const import (
     CONF_NODE,
     CONF_PAGES,
     CONF_PAGES_PATH,
+    CONF_PLATE,
     CONF_RELAYS,
     CONF_TOPIC,
+    DATA_TOPIC_OWNERS,
     DEFAULT_IDLE_BRIGHNESS,
-    DEFAULT_TOPIC,
     DISCOVERED_DIM,
     DISCOVERED_HWID,
     DISCOVERED_INPUT,
@@ -57,13 +59,184 @@ def canonical_plate_id(discovered):
     return hwid
 
 
+def normalize_mqtt_topic(topic):
+    """Return a comparable MQTT base topic."""
+    return str(topic or "").rstrip("/")
+
+
+def topic_entries(hass, topic):
+    """Return enabled config entries currently storing a topic."""
+    normalized_topic = normalize_mqtt_topic(topic)
+    if not normalized_topic:
+        return []
+
+    return [
+        entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.disabled_by is None
+        and normalize_mqtt_topic(entry.data.get(CONF_TOPIC)) == normalized_topic
+    ]
+
+
+def find_topic_collision(hass, topic, plate_id, entry_id=None):
+    """Return the enabled config entry using a topic for another plate."""
+    normalized_topic = normalize_mqtt_topic(topic)
+    if not normalized_topic:
+        return None
+
+    for entry in topic_entries(hass, topic):
+        if entry_id is not None and entry.entry_id == entry_id:
+            continue
+
+        try:
+            entry_plate_id = canonical_plate_id(entry.data)
+        except data_entry_flow.AbortFlow:
+            continue
+
+        if entry_plate_id == plate_id:
+            continue
+
+        if normalize_mqtt_topic(entry.data.get(CONF_TOPIC)) == normalized_topic:
+            return entry
+
+    return None
+
+
+async def async_block_topic_collisions(hass, topic, keep_entry=None):
+    """Disable all stored owners except an authoritative discovered entry."""
+    entries = topic_entries(hass, topic)
+    if keep_entry is not None:
+        entries = [
+            entry for entry in entries if entry.entry_id != keep_entry.entry_id
+        ]
+
+    for entry in entries:
+        conflict = next(
+            (
+                candidate
+                for candidate in topic_entries(hass, topic)
+                if candidate.entry_id != entry.entry_id
+            ),
+            None,
+        )
+        if keep_entry is not None:
+            log_topic_collision(
+                keep_entry.entry_id,
+                keep_entry.data.get(CONF_HWID),
+                keep_entry.data.get(CONF_NAME),
+                topic,
+                entry,
+            )
+        elif conflict is not None:
+            log_topic_collision(
+                entry.entry_id,
+                entry.data.get(CONF_HWID),
+                entry.data.get(CONF_NAME),
+                topic,
+                conflict,
+            )
+        _LOGGER.error(
+            "Blocking stored MQTT topic owner until discovery: "
+            "entry_id=%s hwid=%s name=%s topic=%s",
+            entry.entry_id,
+            entry.data.get(CONF_HWID),
+            entry.data.get(CONF_NAME),
+            entry.data.get(CONF_TOPIC),
+        )
+        if entry.entry_id in hass.data.get(DOMAIN, {}).get(CONF_PLATE, {}):
+            _LOGGER.error("DISABLING STALE CLAIM entry_id=%s", entry.entry_id)
+        await hass.config_entries.async_set_disabled_by(
+            entry.entry_id, ConfigEntryDisabler.USER
+        )
+
+
+async def async_recover_discovered_owner(
+    hass, plate_id, topic, owner_entry=None
+):
+    """Make a discovered hardware id authoritative for its MQTT topic."""
+    normalized_topic = normalize_mqtt_topic(topic)
+    owners = hass.data.setdefault(DOMAIN, {}).setdefault(DATA_TOPIC_OWNERS, {})
+    owners[normalized_topic] = plate_id
+
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if owner_entry is not None and entry.entry_id == owner_entry.entry_id:
+            continue
+        try:
+            entry_plate_id = canonical_plate_id(entry.data)
+        except data_entry_flow.AbortFlow:
+            continue
+
+        if entry_plate_id == plate_id:
+            continue
+        if normalize_mqtt_topic(entry.data.get(CONF_TOPIC)) != normalized_topic:
+            continue
+
+        _LOGGER.error(
+            "STALE TOPIC CLAIM entry_id=%s hwid=%s topic=%s",
+            entry.entry_id,
+            entry_plate_id,
+            entry.data.get(CONF_TOPIC),
+        )
+        _LOGGER.error("DISABLING STALE CLAIM entry_id=%s", entry.entry_id)
+        await hass.config_entries.async_set_disabled_by(
+            entry.entry_id, ConfigEntryDisabler.USER
+        )
+
+
+async def async_apply_discovered_entry(hass, entry, updates):
+    """Apply authoritative discovery data and reload the discovered entry."""
+    was_loaded = entry.entry_id in hass.data.get(DOMAIN, {}).get(CONF_PLATE, {})
+    was_disabled_by_user = entry.disabled_by == ConfigEntryDisabler.USER
+    topic = updates.get(CONF_TOPIC)
+    topic_changed = topic is not None and normalize_mqtt_topic(
+        entry.data.get(CONF_TOPIC)
+    ) != topic
+
+    if was_loaded and topic_changed:
+        await hass.config_entries.async_unload(entry.entry_id)
+
+    await async_recover_discovered_owner(
+        hass, canonical_plate_id(entry.data), topic, owner_entry=entry
+    )
+
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, **updates},
+    )
+
+    if was_disabled_by_user:
+        _LOGGER.error("ENABLING DISCOVERED OWNER entry_id=%s", entry.entry_id)
+        _LOGGER.error("RELOADING DISCOVERED OWNER entry_id=%s", entry.entry_id)
+        await hass.config_entries.async_set_disabled_by(entry.entry_id, None)
+    elif not was_loaded or topic_changed:
+        _LOGGER.error("RELOADING DISCOVERED OWNER entry_id=%s", entry.entry_id)
+        await hass.config_entries.async_setup(entry.entry_id)
+
+
+def log_topic_collision(entry_id, hwid, name, topic, conflict):
+    """Log both sides of an MQTT topic collision."""
+    _LOGGER.error(
+        "MQTT topic collision: entry_id=%s hwid=%s name=%s topic=%s "
+        "conflicts with entry_id=%s hwid=%s name=%s topic=%s",
+        entry_id,
+        hwid,
+        name,
+        topic,
+        conflict.entry_id,
+        conflict.data.get(CONF_HWID),
+        conflict.data.get(CONF_NAME),
+        conflict.data.get(CONF_TOPIC),
+    )
+
+
 def discovery_entry_updates(discovered):
     """Return dynamic config entry data from a discovery payload."""
-    return {
-        key: value
-        for key in (CONF_TOPIC, DISCOVERED_URL)
-        if (value := discovered.get(key)) is not None
-    }
+    updates = {}
+    if (topic := discovered.get(CONF_TOPIC)) is not None:
+        updates[CONF_TOPIC] = normalize_mqtt_topic(topic)
+    if (url := discovered.get(DISCOVERED_URL)) is not None:
+        updates[DISCOVERED_URL] = url
+    return updates
 
 
 def validate_jsonl(path):
@@ -125,7 +298,9 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         _discovered = dict(discovery_info.properties)
         _LOGGER.debug("Discovered ZeroConf: %s", _discovered)
 
-        _discovered[CONF_TOPIC] = _discovered[DISCOVERED_NODE_T][:-1]
+        _discovered[CONF_TOPIC] = normalize_mqtt_topic(
+            _discovered[DISCOVERED_NODE_T]
+        )
 
         for key in [
             DISCOVERED_PAGES,
@@ -149,22 +324,40 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         _discovered = json.loads(discovery_info.payload)
         _LOGGER.debug("Discovered MQTT: %s", _discovered)
 
-        _discovered[
-            CONF_TOPIC
-        ] = f"{discovery_info.topic.split('/')[0]}/{_discovered[DISCOVERED_NODE]}"
+        _discovered[CONF_TOPIC] = normalize_mqtt_topic(
+            f"{discovery_info.topic.split('/')[0]}/{_discovered[DISCOVERED_NODE]}"
+        )
 
         return await self._process_discovery(_discovered)
 
     async def _process_discovery(self, _discovered):
         plate_id = canonical_plate_id(_discovered)
         updates = discovery_entry_updates(_discovered)
+        discovered_topic = updates.get(CONF_TOPIC)
 
         if entry := self._async_entry_for_plate_id(plate_id):
+            _LOGGER.error(
+                "DISCOVERY OWNER hwid=%s entry_id=%s topic=%s",
+                plate_id,
+                entry.entry_id,
+                discovered_topic,
+            )
             if updates:
-                self.hass.config_entries.async_update_entry(
-                    entry, data={**entry.data, **updates}
-                )
+                await async_apply_discovered_entry(self.hass, entry, updates)
             return self.async_abort(reason="already_configured")
+
+        if discovered_topic:
+            _LOGGER.error(
+                "DISCOVERY OWNER hwid=%s entry_id=<new> topic=%s",
+                plate_id,
+                discovered_topic,
+            )
+            # This discovery is authoritative. Any enabled entry that merely
+            # stores this topic for another hardware id is stale and must not
+            # block the discovered device.
+            await async_recover_discovered_owner(
+                self.hass, plate_id, discovered_topic
+            )
 
         await self.async_set_unique_id(plate_id)
         self._abort_if_unique_id_configured(updates=updates)
@@ -184,7 +377,7 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self.config_data[CONF_NODE] = self.config_data[CONF_NAME] = _discovered[
             DISCOVERED_NODE
         ]
-        self.config_data[CONF_TOPIC] = _discovered[CONF_TOPIC]
+        self.config_data[CONF_TOPIC] = normalize_mqtt_topic(_discovered[CONF_TOPIC])
 
         self.config_data[DISCOVERED_URL] = _discovered.get(DISCOVERED_URL)
         self.config_data[DISCOVERED_MANUFACTURER] = _discovered.get(
@@ -208,12 +401,12 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self._errors = {}
 
         if user_input is not None:
+            discovered_topic = self.config_data.get(CONF_TOPIC)
             self.config_data = {**self.config_data, **user_input}
 
-            # Remove / from base topic
-            if user_input[CONF_TOPIC].endswith("/"):
-                user_input[CONF_TOPIC] = user_input[CONF_TOPIC][:-1]
-                self.config_data[CONF_TOPIC] = user_input[CONF_TOPIC]
+            # Discovery owns the physical MQTT routing topic.
+            if discovered_topic is not None:
+                self.config_data[CONF_TOPIC] = normalize_mqtt_topic(discovered_topic)
 
             try:
                 valid_subscribe_topic(self.config_data[CONF_TOPIC])
@@ -223,10 +416,22 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                         user_input[CONF_PAGES_PATH]
                     )
 
-                await self.async_set_unique_id(
-                    canonical_plate_id(self.config_data)
-                )
+                plate_id = canonical_plate_id(self.config_data)
+                await self.async_set_unique_id(plate_id)
                 self._abort_if_unique_id_configured()
+
+                conflict = find_topic_collision(
+                    self.hass, self.config_data[CONF_TOPIC], plate_id
+                )
+                if conflict:
+                    log_topic_collision(
+                        "<new>",
+                        plate_id,
+                        self.config_data.get(CONF_NAME),
+                        self.config_data[CONF_TOPIC],
+                        conflict,
+                    )
+                    return self.async_abort(reason="topic_collision")
 
                 return self.async_create_entry(
                     title=user_input[CONF_NAME], data=self.config_data
@@ -242,10 +447,6 @@ class OpenHASPFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="personalize",
             data_schema=vol.Schema(
                 {
-                    vol.Required(
-                        CONF_TOPIC,
-                        default=self.config_data.get(CONF_TOPIC, DEFAULT_TOPIC),
-                    ): str,
                     vol.Required(
                         CONF_NAME, default=self.config_data.get(CONF_NAME)
                     ): str,
